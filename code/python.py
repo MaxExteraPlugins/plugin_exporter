@@ -1,0 +1,2209 @@
+# -*- coding: utf-8 -*-
+import os
+import sys
+import time
+import json
+import zlib
+import base64
+import re
+import ast
+import zipfile
+import io
+import threading
+import traceback
+import weakref
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import send_document, run_on_queue, get_last_fragment
+from file_utils import get_plugins_dir
+from hook_utils import find_class
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Divider
+
+from java import dynamic_proxy, jclass
+from java.io import File as JavaFile
+from java.util import Locale
+from org.telegram.messenger import ApplicationLoader, NotificationCenter, Utilities, UserConfig, FileLoader
+
+try:
+    import plugin_settings as engine_settings
+except ImportError:
+    engine_settings = None
+
+try:
+    from com.exteragram.messenger.plugins import PluginsController
+except ImportError:
+    PluginsController = None
+
+__id__ = "plugin_exporter"
+__name__ = "Plugin Exporter"
+__description__ = """Thanks: @chillden4ik, @oodze. Credits: @Playerqwe, @ArThirtyFour
+
+[EN]: A plugin for a quick, complete export of plugins and their data
+Usage: send the command .export in the chat, or go to: three dots -> Plugins -> Export plugins
+
+[RU]: Плагин для быстрого полного экспорта плагинов и их данных
+Использование: отправьте команду .export в чате / в чате: три точки -> Плагины -> Экспорт плагинов"""
+
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "1.0.8"
+__icon__ = "MaxExteraPluginsStickers/34"
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+
+ENTRY_CLASS = "com.exteraplugins.max_cactus_export.Main"
+DEX_BEGIN = "__DEX_BEGIN__"
+DEX_END = "__DEX_END__"
+
+FileClass = JavaFile
+
+
+def get_private_field(obj, field_name):
+    try:
+        field = obj.getClass().getDeclaredField(field_name)
+        field.setAccessible(True)
+        return field.get(obj)
+    except Exception:
+        try:
+            field = obj.getClass().getSuperclass().getDeclaredField(field_name)
+            field.setAccessible(True)
+            return field.get(obj)
+        except Exception:
+            return None
+
+
+def _parse_yaml_simple(text):
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip()
+        val = val.strip().strip("'\"")
+        if key:
+            result[key] = val
+    return result
+
+
+def _zip_folder_to_bytes(folder_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(folder_path):
+            for fn in files:
+                if fn == ".DS_Store" or fn.startswith(".temp"):
+                    continue
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, folder_path)
+                zf.write(full, rel)
+    return buf.getvalue()
+
+
+def _read_elyx_dir_metadata(dir_path):
+    meta = {}
+    base_id = os.path.basename(dir_path)
+    meta_path = None
+
+    for rname in ("refmap.yml", "refmap.yaml", "refmap.json"):
+        rp = os.path.join(dir_path, rname)
+        if os.path.exists(rp):
+            try:
+                with open(rp, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                rdata = _parse_yaml_simple(content) if not rname.endswith(".json") else json.loads(content)
+                meta_rel = rdata.get("metainfo", "")
+                if meta_rel:
+                    cand = os.path.join(dir_path, meta_rel)
+                    if os.path.exists(cand):
+                        meta_path = cand
+            except Exception:
+                pass
+            break
+
+    if not meta_path:
+        for c in ("metainfo.yml", "metainfo.yaml", "meta.yml", "meta.yaml", "metainfo.json", "meta.json"):
+            cand = os.path.join(dir_path, c)
+            if os.path.exists(cand):
+                meta_path = cand
+                break
+        if not meta_path:
+            sub = os.path.join(dir_path, base_id)
+            if os.path.isdir(sub):
+                for c in ("meta.yml", "metainfo.yml"):
+                    cand = os.path.join(sub, c)
+                    if os.path.exists(cand):
+                        meta_path = cand
+                        break
+
+    if meta_path and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m = _parse_yaml_simple(content) if not meta_path.endswith(".json") else json.loads(content)
+            for k in ("id", "name", "version", "icon"):
+                if k in m:
+                    meta[f"__{k}__"] = str(m[k])
+        except Exception:
+            pass
+
+    if not meta.get("__id__"):
+        meta["__id__"] = base_id
+    if not meta.get("__name__"):
+        meta["__name__"] = meta["__id__"]
+    return meta
+
+
+def _read_elyx_zip_metadata(filepath):
+    meta = {}
+    base_id = os.path.splitext(os.path.basename(filepath))[0]
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            namelist = zf.namelist()
+            meta_path = None
+            for rname in ("refmap.yml", "refmap.yaml", "refmap.json"):
+                if rname in namelist:
+                    raw = zf.read(rname).decode("utf-8", errors="ignore")
+                    rdata = _parse_yaml_simple(raw) if not rname.endswith(".json") else json.loads(raw)
+                    meta_rel = rdata.get("metainfo", "")
+                    if meta_rel and meta_rel in namelist:
+                        meta_path = meta_rel
+                    break
+
+            if not meta_path:
+                for candidate in ("metainfo.yml", "metainfo.yaml", "meta.yml", "meta.yaml", "metainfo.json", "meta.json"):
+                    if candidate in namelist:
+                        meta_path = candidate
+                        break
+
+            if not meta_path:
+                for name in namelist:
+                    if name.endswith(("/metainfo.yml", "/meta.yml")):
+                        meta_path = name
+                        break
+
+            if meta_path and meta_path in namelist:
+                raw = zf.read(meta_path).decode("utf-8", errors="ignore")
+                m = _parse_yaml_simple(raw) if not meta_path.endswith(".json") else json.loads(raw)
+                for k in ("id", "name", "version", "icon"):
+                    if k in m:
+                        meta[f"__{k}__"] = str(m[k])
+    except Exception:
+        pass
+
+    if not meta.get("__id__"):
+        meta["__id__"] = base_id
+    if not meta.get("__name__"):
+        meta["__name__"] = meta["__id__"]
+    return meta
+
+
+def _find_plugin_path(plugins_dir, pid):
+    if not plugins_dir or not os.path.exists(plugins_dir):
+        return None
+
+    pid_str = str(pid)
+    pid_lower = pid_str.lower()
+
+    # 1. Приоритет №1: обычные плагины в корне plugins_dir (.plugin / .py)
+    # Если на диске лежит .plugin или .py — берем его сразу, не глядя в archives!
+    for ext in ('.plugin', '.py'):
+        c = os.path.join(plugins_dir, f"{pid_str}{ext}")
+        if os.path.isfile(c):
+            return c
+
+    try:
+        for fname in os.listdir(plugins_dir):
+            base, ext = os.path.splitext(fname)
+            if base.lower() == pid_lower and ext.lower() in ('.plugin', '.py'):
+                p = os.path.join(plugins_dir, fname)
+                if os.path.isfile(p):
+                    return p
+    except Exception:
+        pass
+
+    # 2. Приоритет №2: Elyx-плагины в корне plugins_dir (.elyx / .eaf)
+    for ext in ('.elyx', '.eaf'):
+        c = os.path.join(plugins_dir, f"{pid_str}{ext}")
+        if os.path.isfile(c):
+            return c
+
+    try:
+        for fname in os.listdir(plugins_dir):
+            base, ext = os.path.splitext(fname)
+            if base.lower() == pid_lower and ext.lower() in ('.elyx', '.eaf'):
+                p = os.path.join(plugins_dir, fname)
+                if os.path.isfile(p):
+                    return p
+    except Exception:
+        pass
+
+    # 3. Приоритет №3: Elyx-плагины в ElyxPlugins/ (папка или архив)
+    elyx_dir = os.path.join(plugins_dir, "ElyxPlugins")
+    if os.path.isdir(elyx_dir):
+        # 3.1 Проверяем распакованную папку в ElyxPlugins/
+        direct_folder = os.path.join(elyx_dir, pid_str)
+        if os.path.isdir(direct_folder):
+            # Если для этой папки есть оригинальный архив в archives/ — берем его
+            for ext in ('.elyx', '.eaf'):
+                arch = os.path.join(elyx_dir, "archives", f"{pid_str}{ext}")
+                if os.path.isfile(arch):
+                    return arch
+            return direct_folder
+
+        # Регистронезависимый поиск распакованной папки в ElyxPlugins/
+        try:
+            for name in os.listdir(elyx_dir):
+                if name.lower() == pid_lower:
+                    d = os.path.join(elyx_dir, name)
+                    if os.path.isdir(d):
+                        for ext in ('.elyx', '.eaf'):
+                            arch = os.path.join(elyx_dir, "archives", f"{name}{ext}")
+                            if os.path.isfile(arch):
+                                return arch
+                            arch2 = os.path.join(elyx_dir, "archives", f"{pid_str}{ext}")
+                            if os.path.isfile(arch2):
+                                return arch2
+                        return d
+        except Exception:
+            pass
+
+        # 3.2 Проверяем архивы в ElyxPlugins/archives/
+        arch_dir = os.path.join(elyx_dir, "archives")
+        if os.path.isdir(arch_dir):
+            for ext in ('.elyx', '.eaf'):
+                arch = os.path.join(arch_dir, f"{pid_str}{ext}")
+                if os.path.isfile(arch):
+                    return arch
+            try:
+                for name in os.listdir(arch_dir):
+                    base, ext = os.path.splitext(name)
+                    if base.lower() == pid_lower and ext.lower() in ('.elyx', '.eaf'):
+                        return os.path.join(arch_dir, name)
+            except Exception:
+                pass
+
+    # 4. Приоритет №4: распакованная папка в корне plugins_dir
+    root_folder = os.path.join(plugins_dir, pid_str)
+    if os.path.isdir(root_folder):
+        return root_folder
+
+    return None
+
+
+if hasattr(sys, "_cactus_Callback"):
+    Callback = sys._cactus_Callback
+else:
+    class Callback(dynamic_proxy(Utilities.Callback)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def run(self, arg):
+            try:
+                self.fn(arg)
+            except Exception:
+                traceback.print_exc()
+
+    sys._cactus_Callback = Callback
+
+
+class Dex:
+    def __init__(self, ec: str):
+        self.ec = ec
+        self.clazz = None
+        self.loaded = False
+        self.loading = False
+        self._m = {}
+
+    def load(self):
+        if self.loaded or self.loading:
+            return
+        self.loading = True
+        try:
+            if self.clazz is None:
+                ctx = ApplicationLoader.applicationContext
+                if not ctx:
+                    raise RuntimeError("Application context is null")
+                raw = self._read_payload()
+                loader_cls = jclass("dalvik.system.InMemoryDexClassLoader")
+                loader = loader_cls(jclass("java.nio.ByteBuffer").wrap(raw), ctx.getClassLoader())
+                self.clazz = loader.loadClass(self.ec)
+                self._m = {}
+                for m in self.clazz.getDeclaredMethods():
+                    m.setAccessible(True)
+                    name = str(m.getName())
+                    if name not in self._m:
+                        self._m[name] = []
+                    self._m[name].append(m)
+            if "load" in self._m:
+                self._invoke_best("load")
+            self.loaded = True
+            self.loading = False
+        except Exception:
+            self.loading = False
+            traceback.print_exc()
+
+    def unload(self):
+        try:
+            if self.loaded and "unload" in self._m:
+                self._invoke_best("unload")
+        except Exception:
+            traceback.print_exc()
+        self.loaded = False
+
+    def call(self, name: str, *args):
+        try:
+            if not self.loaded:
+                self.load()
+            if self.loaded and name in self._m:
+                return self._invoke_best(name, *args)
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    def _invoke_best(self, name: str, *args):
+        methods = self._m.get(name, [])
+        for m in methods:
+            if len(m.getParameterTypes()) == len(args):
+                try:
+                    return m.invoke(None, *args)
+                except TypeError:
+                    return m.invoke(None, list(args))
+        if methods:
+            try:
+                return methods[0].invoke(None, *args)
+            except TypeError:
+                return methods[0].invoke(None, list(args))
+        return None
+
+    def _read_payload(self) -> bytes:
+        with open(__file__, "r", encoding="utf-8") as f:
+            t = f.read()
+        if "# " + DEX_BEGIN not in t or "# " + DEX_END not in t:
+            raise RuntimeError("DEX markers missing in plugin file")
+        b = t.split("# " + DEX_BEGIN, 1)[1].split("# " + DEX_END, 1)[0]
+        p = "".join(l.strip()[1:].strip() for l in b.splitlines() if l.strip().startswith("#"))
+        if not p:
+            raise RuntimeError("DEX payload empty")
+        return zlib.decompress(base64.b64decode(p))
+
+
+class OpenForViewHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin_ref = weakref.ref(plugin)
+
+    def before_hooked_method(self, param):
+        try:
+            plugin = self._plugin_ref()
+            if not plugin:
+                return
+            args = param.args
+            if not args or len(args) == 0:
+                return
+            arg0 = args[0]
+            if not arg0:
+                return
+
+            fn = ""
+            path = ""
+
+            # 1. Check if arg0 is java.io.File
+            if hasattr(arg0, "getAbsolutePath"):
+                try:
+                    path = str(arg0.getAbsolutePath() or "")
+                except Exception:
+                    pass
+            if hasattr(arg0, "getName"):
+                try:
+                    fn = str(arg0.getName() or "")
+                except Exception:
+                    pass
+
+            # 2. Check if arg0 is MessageObject
+            if not fn and hasattr(arg0, "getDocumentName"):
+                try:
+                    fn = str(arg0.getDocumentName() or "")
+                except Exception:
+                    pass
+            if not fn and hasattr(arg0, "getFileName"):
+                try:
+                    fn = str(arg0.getFileName() or "")
+                except Exception:
+                    pass
+            if not fn and hasattr(arg0, "messageOwner"):
+                try:
+                    media = arg0.messageOwner.media
+                    doc = media.document if media else None
+                    if doc:
+                        fl_cls = find_class("org.telegram.messenger.FileLoader")
+                        if fl_cls:
+                            fn = str(fl_cls.getDocumentFileName(doc) or "")
+                except Exception:
+                    pass
+
+            # 3. Check args[1] (filename in openForView(File, String name, ...))
+            if len(args) > 1 and isinstance(args[1], str) and args[1]:
+                fn = fn or args[1]
+
+            is_target = (fn and fn.lower().endswith(".pl_export")) or (path and path.lower().endswith(".pl_export"))
+
+            if is_target:
+                param.setResult(True)
+                if path and os.path.exists(path):
+                    run_on_ui_thread(lambda: plugin.open_import_ui(path))
+                else:
+                    run_on_ui_thread(lambda: plugin._handle_backup_message(arg0))
+                return
+        except Exception:
+            traceback.print_exc()
+
+
+
+# ============================================================
+# MaxExteraPlugins Shared Author & Channel Subscription Module
+# ============================================================
+class AuthorChannelHelper:
+    CONFIG_URL = "https://raw.githubusercontent.com/MaxExteraPlugins/config/main/links.json"
+
+    DEFAULT_LINKS = {
+        "channel_username": "MaxExteraPlugins",
+        "channel_url": "https://t.me/MaxExteraPlugins",
+        "trial_days": 7,
+        "header": {"ru": "MaxExteraPlugins", "en": "MaxExteraPlugins"},
+        "buttons": [
+            {"title": {"ru": "Канал автора", "en": "Author's Channel"}, "icon": "msg_channel", "url": "https://t.me/MaxExteraPlugins"},
+            {"title": {"ru": "Поддержать автора", "en": "Support author"}, "icon": "msg_share", "url": "https://t.me/itNotMax"},
+            {"title": {"ru": "Сообщить о баге", "en": "Report a bug"}, "icon": "msg_help", "url": "https://t.me/itNotMax"}
+        ]
+    }
+
+    _TEXTS = {
+        "install_card_title": {"ru": "Спасибо за установку!", "en": "Thank you for installing!"},
+        "install_card_msg": {
+            "ru": "Надеемся, что плагин будет вам полезен!\n\nМы делаем плагины бесплатными и доступными для всех: пожалуйста, поддержите нас подпиской. Там будут только важные новости, обновления и розыгрыши.",
+            "en": "We hope this plugin will be useful to you!\n\nWe keep our plugins free and open for everyone: please support us with a subscription. We only post key news, updates, and giveaways."
+        },
+        "subscribe_btn": {"ru": "Подписаться", "en": "Subscribe"},
+        "remind_later_btn": {"ru": "Напомнить позже", "en": "Remind later"},
+        "check_sub_btn": {"ru": "Проверить подписку", "en": "Check subscription"},
+        "trial_expired_title": {"ru": "Пожалуйста, подпишитесь на канал", "en": "Please subscribe to the channel"},
+        "trial_expired_msg": {
+            "ru": "Пожалуйста, подпишитесь на наш официальный канал.\n\nМы делаем плагины бесплатно, ничего не требуя взамен. До подписки функции плагина временно приостановлены.",
+            "en": "Please subscribe to our official channel.\n\nWe develop plugins for free and ask nothing in return. Plugin features are paused until you subscribe."
+        },
+        "sub_thank_you": {"ru": "Спасибо за подписку на наш канал!", "en": "Thank you for subscribing to our channel!"},
+        "sub_thank_you_after_expired": {"ru": "Спасибо за подписку на наш канал!\nПлагин продолжит работу!", "en": "Thank you for subscribing to our channel!\nThe plugin will continue working!"},
+        "sub_not_found": {"ru": "Подписка не обнаружена. Пожалуйста, подпишитесь на канал.", "en": "Subscription not found. Please subscribe to the channel."},
+        "settings_channel": {"ru": "Канал автора", "en": "Author's Channel"},
+        "settings_donate": {"ru": "Поддержать автора", "en": "Support author"},
+        "settings_bug_report": {"ru": "Сообщить о баге", "en": "Report a bug"}
+    }
+
+    @classmethod
+    def is_ru(cls) -> bool:
+        try:
+            from org.telegram.messenger import LocaleController
+            cur = str(LocaleController.getInstance().getCurrentLocale().getLanguage() or "").lower()
+            if cur.startswith(("ru", "uk", "be")): return True
+            if cur: return False
+        except Exception:
+            pass
+        try:
+            from java.util import Locale
+            code = str(Locale.getDefault().getLanguage() or "").lower()
+            if code.startswith(("ru", "uk", "be")): return True
+        except Exception:
+            pass
+        return False
+
+    @classmethod
+    def tr(cls, key: str) -> str:
+        entry = cls._TEXTS.get(key, {})
+        return entry.get("ru" if cls.is_ru() else "en", entry.get("en", key))
+
+    def __init__(self, plugin, icon_sticker=None):
+        self.plugin = plugin
+        self.icon_sticker = icon_sticker or getattr(plugin, "__icon__", "MaxExteraPluginsStickers/1")
+        self._stopped = False
+        self._active_dialog = None
+        self._last_known_sub = None
+
+    def on_load(self):
+        self._stopped = False
+        self._active_dialog = None
+        self._last_known_sub = None
+        self._load_remote_links_async()
+        self._check_initial_subscription_flow()
+        self._start_subscription_watcher()
+
+    def on_event(self, event_type):
+        try:
+            name = str(event_type).upper()
+            if name.endswith("START") or name.endswith("RESUME"):
+                self._check_subscription_change_instant()
+        except Exception:
+            pass
+
+    def on_unload(self):
+        self._stopped = True
+        self._dismiss_active_dialog()
+
+    def _get_links(self) -> dict:
+        raw = self.plugin.get_setting("remote_links_cache", None)
+        if raw:
+            try:
+                import json
+                data = json.loads(raw)
+                if isinstance(data, dict): return data
+            except Exception:
+                pass
+        return self.DEFAULT_LINKS
+
+    def _load_remote_links_async(self):
+        def worker():
+            try:
+                import urllib.request, json
+                req = urllib.request.Request(self.CONFIG_URL, headers={"User-Agent": "MaxExteraPlugins"})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if isinstance(data, dict):
+                            self.plugin.set_setting("remote_links_cache", json.dumps(data))
+                            self._resolve_channel_in_telegram(data.get("channel_username", "MaxExteraPlugins"))
+            except Exception:
+                pass
+        import threading
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+    def _open_url(self, url: str, view=None):
+        try:
+            from org.telegram.messenger.browser import Browser
+            from org.telegram.messenger import ApplicationLoader
+            from client_utils import get_last_fragment
+            ctx = None
+            if view is not None:
+                ctx = view.getContext()
+            if ctx is None:
+                frag = get_last_fragment()
+                if frag is not None:
+                    ctx = frag.getParentActivity()
+            if ctx is None:
+                ctx = ApplicationLoader.applicationContext
+            Browser.openUrl(ctx, url)
+        except Exception:
+            pass
+
+    def _resolve_channel_in_telegram(self, username: str):
+        try:
+            from org.telegram.messenger import UserConfig, MessagesController
+            from org.telegram.tgnet import TLRPC, ConnectionsManager, RequestDelegate
+            clean_user = username.lstrip("@")
+            acc = int(UserConfig.selectedAccount)
+            mc = MessagesController.getInstance(acc)
+            if not mc: return
+            req = TLRPC.TL_contacts_resolveUsername()
+            req.username = clean_user
+            helper_ref = self
+            class Delegate(RequestDelegate):
+                def run(self, response, error):
+                    if error is None and response is not None:
+                        chats = getattr(response, "chats", None)
+                        if chats is not None and chats.size() > 0:
+                            mc.putChats(chats, False)
+                            c = chats.get(0)
+                            cid = getattr(c, "id", 0)
+                            if cid > 0:
+                                helper_ref.plugin.set_setting("resolved_channel_id", int(cid))
+            ConnectionsManager.getInstance(acc).sendRequest(req, Delegate())
+        except Exception:
+            pass
+
+    def is_subscribed(self) -> bool:
+        try:
+            from org.telegram.messenger import UserConfig, MessagesController
+            links = self._get_links()
+            target = str(links.get("channel_username", "MaxExteraPlugins") or "MaxExteraPlugins").lower().lstrip("@")
+            saved_cid = self.plugin.get_setting("resolved_channel_id", 0)
+
+            for acc in range(UserConfig.MAX_ACCOUNT_COUNT):
+                uconf = UserConfig.getInstance(acc)
+                if not uconf.isClientActivated(): continue
+                mc = MessagesController.getInstance(acc)
+                if not mc: continue
+
+                if saved_cid:
+                    try:
+                        from java.lang import Long as JLong
+                        c = mc.getChat(JLong(int(saved_cid)))
+                        if c is not None:
+                            left = bool(getattr(c, "left", True))
+                            kicked = bool(getattr(c, "kicked", False))
+                            if not left and not kicked: return True
+                    except Exception:
+                        pass
+
+                try:
+                    chat = mc.getUserOrChat(target)
+                    if chat is not None:
+                        cid = getattr(chat, "id", 0)
+                        if cid and not saved_cid:
+                            self.plugin.set_setting("resolved_channel_id", int(cid))
+                        left = bool(getattr(chat, "left", True))
+                        kicked = bool(getattr(chat, "kicked", False))
+                        if not left and not kicked: return True
+                except Exception:
+                    pass
+
+                try:
+                    dialogs = mc.allDialogs
+                    if dialogs is not None:
+                        limit = min(dialogs.size(), 300)
+                        for i in range(limit):
+                            d = dialogs.get(i)
+                            did = getattr(d, "id", 0)
+                            if did < 0:
+                                from java.lang import Long as JLong
+                                c = mc.getChat(JLong(-did))
+                                if c is not None:
+                                    uname = str(getattr(c, "username", "") or "").lower()
+                                    if uname == target:
+                                        cid = getattr(c, "id", 0)
+                                        if cid and not saved_cid:
+                                            self.plugin.set_setting("resolved_channel_id", int(cid))
+                                        left = bool(getattr(c, "left", True))
+                                        kicked = bool(getattr(c, "kicked", False))
+                                        if not left and not kicked: return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
+    def is_allowed(self) -> bool:
+        import time
+        if self.is_subscribed():
+            if not self.plugin.get_setting("was_subscribed", False):
+                was_exp = bool(self.plugin.get_setting("was_expired_state", False))
+                self.plugin.set_setting("was_subscribed", True)
+                self.plugin.set_setting("was_expired_state", False)
+                self._notify_subscribed(was_expired=was_exp)
+            return True
+
+        if self.plugin.get_setting("was_expired_state", False) or self.plugin.get_setting("was_subscribed", False):
+            self.plugin.set_setting("was_subscribed", False)
+            self.plugin.set_setting("was_expired_state", True)
+            self._show_expired_card()
+            return False
+
+        now = time.time()
+        install_time = float(self.plugin.get_setting("install_time", 0.0) or 0.0)
+        if install_time <= 0:
+            install_time = now
+            self.plugin.set_setting("install_time", install_time)
+
+        trial_days = float(self._get_links().get("trial_days", 7))
+        trial_sec = trial_days * 86400.0
+
+        if (now - install_time) < trial_sec:
+            return True
+
+        self.plugin.set_setting("was_expired_state", True)
+        self._show_expired_card()
+        return False
+
+    def prepend_settings(self, original_items=None) -> list:
+        from ui.settings import Header, Text, Divider
+
+        # Prevent double-prepending
+        if original_items and any(getattr(x, "text", "") == "MaxExteraPlugins" for x in original_items if type(x).__name__ == "Header"):
+            return original_items
+
+        links = self._get_links()
+        buttons_config = links.get("buttons")
+
+        author_items = []
+        if isinstance(buttons_config, list):
+            for btn in buttons_config:
+                if not isinstance(btn, dict): continue
+                raw_url = btn.get("url")
+                if isinstance(raw_url, dict):
+                    keys = [
+                        getattr(self.plugin, "id", None),
+                        globals().get("__id__", None),
+                        globals().get("__name__", None),
+                        self.plugin.__class__.__name__
+                    ]
+                    keys += [k.lower() for k in keys if isinstance(k, str)]
+                    resolved_url = ""
+                    for k in keys:
+                        if k and k in raw_url:
+                            resolved_url = str(raw_url[k] or "").strip()
+                            if resolved_url:
+                                break
+                    url = resolved_url
+                elif isinstance(raw_url, str):
+                    url = raw_url.strip()
+                else:
+                    url = ""
+
+                if not url: continue
+
+                title_data = btn.get("title")
+                if isinstance(title_data, dict):
+                    title = title_data.get("ru" if self.is_ru() else "en") or title_data.get("en") or title_data.get("ru") or ""
+                elif isinstance(title_data, str) and title_data:
+                    title = title_data
+                else:
+                    title = btn.get("title_ru" if self.is_ru() else "title_en") or btn.get("title_ru") or btn.get("title_en") or ""
+
+                if not title: continue
+                icon = str(btn.get("icon") or "msg_channel").strip()
+
+                def make_click(u):
+                    return lambda v=None: self._open_url(u, v)
+
+                author_items.append(Text(text=title, icon=icon, on_click=make_click(url)))
+        else:
+            for k, text_key, icon_name in [
+                ("channel_url", "settings_channel", "msg_channel"),
+                ("donate_url", "settings_donate", "msg_share"),
+                ("bug_report_url", "settings_bug_report", "msg_help")
+            ]:
+                u = str(links.get(k) or "").strip()
+                if u:
+                    author_items.append(Text(text=self.tr(text_key), icon=icon_name, on_click=lambda v=None, target_u=u: self._open_url(target_u, v)))
+
+        res = []
+        if author_items:
+            hdr = links.get("header") or "MaxExteraPlugins"
+            if isinstance(hdr, dict):
+                hdr_text = hdr.get("ru" if self.is_ru() else "en") or hdr.get("ru") or hdr.get("en") or "MaxExteraPlugins"
+            else:
+                hdr_text = str(hdr)
+            res.append(Header(text=hdr_text))
+            res.extend(author_items)
+            res.append(Divider())
+
+        # Clean original_items by removing any old "Информация" / "Information" category
+        cleaned_items = []
+        if original_items:
+            skipping_info = False
+            for item in original_items:
+                item_cls = type(item).__name__
+                if item_cls == "Header":
+                    txt = str(getattr(item, "text", "") or getattr(item, "title", "") or "").lower()
+                    if "информ" in txt or "inform" in txt:
+                        skipping_info = True
+                        continue
+                    else:
+                        skipping_info = False
+                elif skipping_info and item_cls == "Divider":
+                    skipping_info = False
+                    continue
+
+                if not skipping_info:
+                    cleaned_items.append(item)
+
+        res.extend(cleaned_items)
+        return res
+
+    def _dismiss_active_dialog(self):
+        try:
+            if self._active_dialog is not None:
+                self._active_dialog.dismiss()
+        except Exception:
+            pass
+        self._active_dialog = None
+
+    def _is_dialog_active(self) -> bool:
+        try:
+            if self._active_dialog is not None:
+                return bool(self._active_dialog.isShowing())
+        except Exception:
+            pass
+        return False
+
+    def _notify_subscribed(self, was_expired=False):
+        self.plugin.set_setting("was_subscribed", True)
+        from ui.bulletin import BulletinHelper
+        msg_key = "sub_thank_you_after_expired" if was_expired else "sub_thank_you"
+        BulletinHelper.show_success(self.tr(msg_key))
+
+    def _check_subscription_change_instant(self):
+        try:
+            from android_utils import run_on_ui_thread
+            cur_sub = self.is_subscribed()
+            prev_sub = self._last_known_sub
+            if prev_sub is not None and prev_sub != cur_sub:
+                self._last_known_sub = cur_sub
+                if cur_sub:
+                    was_exp = bool(self.plugin.get_setting("was_expired_state", False))
+                    self.plugin.set_setting("was_subscribed", True)
+                    self.plugin.set_setting("was_expired_state", False)
+                    self._dismiss_active_dialog()
+                    self._notify_subscribed(was_expired=was_exp)
+                else:
+                    self.plugin.set_setting("was_subscribed", False)
+                    self.plugin.set_setting("was_expired_state", True)
+                    self._dismiss_active_dialog()
+                    self._show_expired_card()
+            else:
+                self._last_known_sub = cur_sub
+        except Exception:
+            pass
+
+    def _start_subscription_watcher(self):
+        def watcher_loop():
+            import time
+            from android_utils import run_on_ui_thread
+            time.sleep(2.0)
+            if self._stopped: return
+            self._last_known_sub = self.is_subscribed()
+
+            while not self._stopped:
+                try:
+                    time.sleep(2.0)
+                    if self._stopped: break
+                    cur_sub = self.is_subscribed()
+                    prev_sub = self._last_known_sub
+
+                    if prev_sub is not None and prev_sub != cur_sub:
+                        self._last_known_sub = cur_sub
+                        if cur_sub:
+                            was_exp = bool(self.plugin.get_setting("was_expired_state", False))
+                            self.plugin.set_setting("was_subscribed", True)
+                            self.plugin.set_setting("was_expired_state", False)
+                            def on_sub():
+                                self._dismiss_active_dialog()
+                                self._notify_subscribed(was_expired=was_exp)
+                            run_on_ui_thread(on_sub)
+                        else:
+                            self.plugin.set_setting("was_subscribed", False)
+                            self.plugin.set_setting("was_expired_state", True)
+                            def on_unsub():
+                                self._dismiss_active_dialog()
+                                self._show_expired_card()
+                            run_on_ui_thread(on_unsub)
+                    else:
+                        self._last_known_sub = cur_sub
+                except Exception:
+                    pass
+        import threading
+        t = threading.Thread(target=watcher_loop, daemon=True)
+        t.start()
+
+    def _check_initial_subscription_flow(self):
+        def flow():
+            import time
+            try:
+                now = time.time()
+                install_time = float(self.plugin.get_setting("install_time", 0.0) or 0.0)
+                if install_time <= 0:
+                    install_time = now
+                    self.plugin.set_setting("install_time", install_time)
+
+                is_sub = self.is_subscribed()
+                self._last_known_sub = is_sub
+                was_sub = bool(self.plugin.get_setting("was_subscribed", False))
+                was_exp = bool(self.plugin.get_setting("was_expired_state", False))
+
+                if is_sub:
+                    if not was_sub:
+                        self.plugin.set_setting("was_subscribed", True)
+                        self.plugin.set_setting("was_expired_state", False)
+                        self._notify_subscribed(was_expired=was_exp)
+                    return
+
+                if was_sub or was_exp:
+                    self.plugin.set_setting("was_subscribed", False)
+                    self.plugin.set_setting("was_expired_state", True)
+                    self._show_expired_card()
+                    return
+
+                trial_days = float(self._get_links().get("trial_days", 7))
+                trial_sec = trial_days * 86400.0
+                last_remind = float(self.plugin.get_setting("last_remind_time", 0.0) or 0.0)
+
+                if (now - install_time) < trial_sec:
+                    if last_remind <= 0 or (now - last_remind) >= trial_sec:
+                        self._show_welcome_card()
+                else:
+                    self.plugin.set_setting("was_expired_state", True)
+                    self._show_expired_card()
+            except Exception:
+                pass
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(flow, 1500)
+
+    def _create_card_content(self, act, title_text, message_text):
+        try:
+            from android.widget import LinearLayout, TextView
+            from android.view import Gravity
+            from android.graphics import Typeface
+            from org.telegram.messenger import AndroidUtilities, UserConfig, MediaDataController
+            from org.telegram.ui.ActionBar import Theme
+            from org.telegram.ui.Components import BackupImageView
+
+            dp = AndroidUtilities.dp
+            layout = LinearLayout(act)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setGravity(Gravity.CENTER_HORIZONTAL)
+            layout.setPadding(dp(24), dp(16), dp(24), dp(6))
+
+            size = dp(76)
+            iv = BackupImageView(act)
+            iv.setRoundRadius(dp(18))
+            lp_iv = LinearLayout.LayoutParams(size, size)
+            lp_iv.gravity = Gravity.CENTER_HORIZONTAL
+            lp_iv.setMargins(0, dp(4), 0, dp(16))
+            iv.setLayoutParams(lp_iv)
+
+            try:
+                acc = int(UserConfig.selectedAccount)
+                mdc = MediaDataController.getInstance(acc)
+                raw_icon = str(self.icon_sticker)
+                if "/" in raw_icon:
+                    pack, idx_s = raw_icon.split("/", 1)
+                    mdc.setPlaceholderImageByIndex(iv, pack, int(idx_s), "150_150")
+            except Exception:
+                pass
+            layout.addView(iv)
+
+            if title_text:
+                tt = TextView(act)
+                tt.setText(title_text)
+                tt.setTextSize(19.0)
+                tt.setTypeface(None, Typeface.BOLD)
+                tt.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                tt.setGravity(Gravity.CENTER_HORIZONTAL)
+                lp_t = LinearLayout.LayoutParams(-1, -2)
+                lp_t.setMargins(0, 0, 0, dp(12))
+                tt.setLayoutParams(lp_t)
+                layout.addView(tt)
+
+            if message_text:
+                mt = TextView(act)
+                mt.setText(message_text)
+                mt.setTextSize(15.0)
+                mt.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                mt.setLineSpacing(float(dp(3)), 1.0)
+                mt.setGravity(Gravity.CENTER_HORIZONTAL)
+                lp_m = LinearLayout.LayoutParams(-1, -2)
+                mt.setLayoutParams(lp_m)
+                layout.addView(mt)
+
+            return layout
+        except Exception:
+            return None
+
+    def _show_welcome_card(self):
+        def show():
+            try:
+                if self._is_dialog_active(): return
+                from client_utils import get_last_fragment
+                frag = get_last_fragment()
+                if not frag: return
+                act = frag.getParentActivity()
+                if not act: return
+
+                links = self._get_links()
+                url = links.get("channel_url", "https://t.me/MaxExteraPlugins")
+
+                from ui.alert import AlertDialogBuilder
+                b = AlertDialogBuilder(act)
+                content = self._create_card_content(act, self.tr("install_card_title"), self.tr("install_card_msg"))
+                if content is not None:
+                    b.set_view(content)
+                else:
+                    b.set_title(self.tr("install_card_title"))
+                    b.set_message(self.tr("install_card_msg"))
+
+                def on_sub(d, w):
+                    self._dismiss_active_dialog()
+                    self._open_url(url)
+                    def check_after():
+                        if self.is_subscribed():
+                            self._notify_subscribed(was_expired=False)
+                    from android_utils import run_on_ui_thread
+                    run_on_ui_thread(check_after, 3000)
+
+                def on_later(d, w):
+                    import time
+                    self._dismiss_active_dialog()
+                    self.plugin.set_setting("last_remind_time", time.time())
+
+                b.set_positive_button(self.tr("subscribe_btn"), on_sub)
+                b.set_negative_button(self.tr("remind_later_btn"), on_later)
+                self._active_dialog = b.show()
+            except Exception:
+                pass
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(show)
+
+    def _show_expired_card(self):
+        def show():
+            try:
+                if self._is_dialog_active(): return
+                from client_utils import get_last_fragment
+                frag = get_last_fragment()
+                if not frag: return
+                act = frag.getParentActivity()
+                if not act: return
+
+                links = self._get_links()
+                url = links.get("channel_url", "https://t.me/MaxExteraPlugins")
+
+                from ui.alert import AlertDialogBuilder
+                from ui.bulletin import BulletinHelper
+                b = AlertDialogBuilder(act)
+                content = self._create_card_content(act, self.tr("trial_expired_title"), self.tr("trial_expired_msg"))
+                if content is not None:
+                    b.set_view(content)
+                else:
+                    b.set_title(self.tr("trial_expired_title"))
+                    b.set_message(self.tr("trial_expired_msg"))
+
+                def on_sub(d, w):
+                    self._dismiss_active_dialog()
+                    self._open_url(url)
+                    def check_after():
+                        if self.is_subscribed():
+                            self.plugin.set_setting("was_subscribed", True)
+                            self.plugin.set_setting("was_expired_state", False)
+                            self._notify_subscribed(was_expired=True)
+                    from android_utils import run_on_ui_thread
+                    run_on_ui_thread(check_after, 3000)
+
+                def on_check(d, w):
+                    self._dismiss_active_dialog()
+                    if self.is_subscribed():
+                        self.plugin.set_setting("was_subscribed", True)
+                        self.plugin.set_setting("was_expired_state", False)
+                        self._notify_subscribed(was_expired=True)
+                    else:
+                        BulletinHelper.show_error(self.tr("sub_not_found"))
+                        from android_utils import run_on_ui_thread
+                        run_on_ui_thread(self._show_expired_card, 500)
+
+                b.set_positive_button(self.tr("subscribe_btn"), on_sub)
+                b.set_negative_button(self.tr("check_sub_btn"), on_check)
+                self._active_dialog = b.show()
+            except Exception:
+                pass
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(show)
+
+
+class MaxCactusExport(BasePlugin):
+    STRINGS = {
+        "en": {
+            "import_alert_title": "Import Plugins",
+            "import_info": "The file contains plugins with saved settings and data.",
+            "import_warning": "Warning: Existing plugin settings or data may be overwritten.",
+            "import_progress": "Importing {}...",
+            "import_done": "Successfully imported {} plugins!",
+            "import": "Import",
+            "export_alert_title": "Export Plugins",
+            "export_info": "Creates a backup archive of selected plugins with settings and data.",
+            "export_warning": "Warning: Plugin settings and files may contain private tokens or history.",
+            "export2": "Export",
+            "export_progress": "Loaded {} plugins for export",
+            "export_done": "Exported successfully!",
+            "cancel": "Cancel",
+            "include_settings": "Plugin settings",
+            "export_settings_sub": "Export saved plugin configuration",
+            "import_settings_sub": "Restore plugin configuration from backup",
+            "include_plugin_data": "Plugin data and memory",
+            "include_plugin_data_sub": "Databases, cache, music stats, and saved files",
+            "import_data_sub": "Restore databases, music stats, and saved files",
+            "include_pinned": "Pinned plugins",
+            "export_pinned_sub": "Save which plugins are pinned",
+            "import_pinned_sub": "Restore pinned state of plugins",
+            "export_error": "Export failed: {}",
+            "import_error": "Import failed: {}",
+            "cat_control": "General",
+            "cmd_menu": "Menu Command",
+            "cat_state": "State on Import",
+            "restore_state": "Same as export",
+            "restore_state_sub": "Restore each plugin's original state (enabled/disabled) from the backup.",
+            "force_enable": "Force Enable",
+            "force_enable_sub": "When enabled, all imported plugins will be activated immediately. If turned off, they will be added disabled.",
+            "not_imported": "Nothing was imported.",
+            "error_empty": "Error: Backup file is empty",
+            "restart_needed": "Please restart exteraGram!",
+            "loading_meta": "Loading plugin list...",
+            "menu_item_title": "Export Plugins",
+            "downloading_file": "Downloading file...",
+            "select_all": "Select All",
+            "deselect_all": "Deselect All"
+        },
+        "ru": {
+            "import_alert_title": "Импорт плагинов",
+            "import_info": "В файле находятся плагины с сохраненными настройками и данными.",
+            "import_warning": "Внимание: Существующие данные и настройки могут быть перезаписаны.",
+            "import_progress": "Импортировано {}",
+            "import_done": "Успешно импортировано {} плагинов!",
+            "import": "Импорт",
+            "export_alert_title": "Экспорт плагинов",
+            "export_info": "Создаёт файл с текущими версиями плагинов, настройками и данными.",
+            "export_warning": "Внимание: Настройки и базы данных могут содержать личную информацию или токены.",
+            "export2": "Экспорт",
+            "export_progress": "Загружено для экспорта: {}",
+            "export_done": "Успешно экспортировано!",
+            "cancel": "Отмена",
+            "include_settings": "Настройки плагинов",
+            "export_settings_sub": "Сохранить конфигурацию плагинов",
+            "import_settings_sub": "Применить настройки плагинов из архива",
+            "include_plugin_data": "Информация и данные плагинов",
+            "include_plugin_data_sub": "Базы данных, статистика музыки, кэш и файлы памяти",
+            "import_data_sub": "Восстановить базы данных, статистику музыки и файлы",
+            "include_pinned": "Закрепление плагинов",
+            "export_pinned_sub": "Сохранить закреплённые плагины в списке",
+            "import_pinned_sub": "Восстановить закрепление плагинов в списке",
+            "export_error": "Ошибка экспорта: {}",
+            "import_error": "Ошибка импорта: {}",
+            "cat_control": "Основные",
+            "cmd_menu": "Команда для меню",
+            "cat_state": "Состояние при импорте",
+            "restore_state": "Как при экспорте",
+            "restore_state_sub": "Восстанавливать исходное состояние плагинов (включён/выключен) из архива.",
+            "force_enable": "Принудительное включение",
+            "force_enable_sub": "Если включено, все плагины из архива будут сразу активированы. Если выключено — они добавятся выключенными.",
+            "not_imported": "Ничего не было импортировано.",
+            "error_empty": "Ошибка: Дамп пуст",
+            "restart_needed": "Требуется перезапуск приложения!",
+            "loading_meta": "Загрузка списка плагинов...",
+            "menu_item_title": "Экспорт плагинов",
+            "downloading_file": "Загрузка файла...",
+            "select_all": "Выбрать все",
+            "deselect_all": "Снять все"
+        }
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.dex = Dex(ENTRY_CLASS)
+        self.installed_plugins_cache = {}
+        self.metadata_loading = False
+        self._unhooks = []
+
+    def on_plugin_load(self):
+        self._author_helper = AuthorChannelHelper(self, icon_sticker=globals().get("__icon__", "MaxExteraPluginsStickers/34"))
+        self._author_helper.on_load()
+        self.dex.load()
+        self.add_on_send_message_hook()
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id="dumper_open_menu",
+                icon="msg_filled_data_sent",
+                text=self._get_string_by_key("menu_item_title"),
+                on_click=lambda _: self._manual_dump(None)
+            )
+        )
+
+        self._install_open_hook()
+        threading.Thread(target=self._scan_all_installed_plugins, daemon=True).start()
+
+    def _install_open_hook(self):
+        try:
+            Class = find_class("java.lang.Class")
+            AU_cls = Class.forName("org.telegram.messenger.AndroidUtilities")
+            if AU_cls:
+                for m in AU_cls.getDeclaredMethods():
+                    if str(m.getName()) == "openForView":
+                        m.setAccessible(True)
+                        try:
+                            u = self.hook_method(m, OpenForViewHook(self))
+                            if u:
+                                self._unhooks.append(u)
+                        except Exception:
+                            pass
+        except Exception:
+            traceback.print_exc()
+
+    def _handle_backup_message(self, message):
+        try:
+            file_path = None
+            try:
+                ChatUtils = find_class("com.exteragram.messenger.utils.chats.ChatUtils")
+                if ChatUtils:
+                    p = ChatUtils.getInstance().getPathToMessage(message)
+                    if p and os.path.exists(str(p)):
+                        file_path = str(p)
+            except Exception:
+                pass
+
+            if not file_path:
+                try:
+                    if hasattr(message, "messageOwner") and message.messageOwner:
+                        media = message.messageOwner.media
+                        doc = media.document if media else None
+                        if doc and hasattr(doc, "localPath") and doc.localPath and os.path.exists(str(doc.localPath)):
+                            file_path = str(doc.localPath)
+                except Exception:
+                    pass
+
+            doc = message.getDocument() if hasattr(message, "getDocument") else None
+            acc = int(UserConfig.selectedAccount)
+
+            if not file_path and doc:
+                try:
+                    fl = FileLoader.getInstance(acc)
+                    f = fl.getPathToAttach(doc, True)
+                    if f and f.exists():
+                        file_path = str(f.getAbsolutePath())
+                    else:
+                        f = fl.getPathToAttach(doc, False)
+                        if f and f.exists():
+                            file_path = str(f.getAbsolutePath())
+                        else:
+                            f = fl.getPathToMessage(message.messageOwner)
+                            if f and f.exists():
+                                file_path = str(f.getAbsolutePath())
+                except Exception:
+                    pass
+
+            if file_path and os.path.exists(file_path):
+                self.open_import_ui(file_path)
+            else:
+                if doc:
+                    FileLoader.getInstance(acc).loadFile(doc, message, 1, 0)
+                    BulletinHelper.show_info(self._get_string_by_key("downloading_file"))
+                else:
+                    BulletinHelper.show_error("Could not find file path")
+        except Exception as e:
+            traceback.print_exc()
+            BulletinHelper.show_error(f"Error opening file: {e}")
+
+    def on_plugin_unload(self):
+        if hasattr(self, "_author_helper"):
+            self._author_helper.on_unload()
+        self.remove_menu_item("dumper_open_menu")
+        for u in self._unhooks:
+            try:
+                self.unhook_method(u)
+            except Exception:
+                pass
+        self._unhooks = []
+        self.dex.unload()
+
+    def on_app_event(self, event_type):
+        if hasattr(self, '_author_helper'):
+            self._author_helper.on_event(event_type)
+
+    def has_settings(self):
+        return True
+
+    def create_settings(self):
+        try:
+            items = self._inner_create_settings()
+        except Exception:
+            items = []
+        if hasattr(self, '_author_helper'):
+            return self._author_helper.prepend_settings(items)
+        return items
+
+    def _inner_create_settings(self):
+        settings = [
+            Header(self._get_string_by_key("cat_control")),
+            Input(key="trigger_command", text=self._get_string_by_key("cmd_menu"), default=".export"),
+            Divider(),
+            Header(self._get_string_by_key("cat_state"))
+        ]
+
+        restore_mode = self.get_setting("restore_state_mode", True)
+
+        settings.append(Switch(
+            key="restore_state_mode",
+            text=self._get_string_by_key("restore_state"),
+            subtext=self._get_string_by_key("restore_state_sub"),
+            default=True,
+            icon="avd_theme",
+            on_change=lambda v: self._refresh_ui()
+        ))
+
+        if not restore_mode:
+            settings.append(Switch(
+                key="force_enable_mode",
+                text=self._get_string_by_key("force_enable"),
+                subtext=self._get_string_by_key("force_enable_sub"),
+                default=False,
+                icon="ic_unlock",
+                on_change=lambda v: self._refresh_ui()
+            ))
+
+        return settings
+
+    def _refresh_ui(self):
+        run_on_ui_thread(lambda: self._refresh_ui_safe())
+
+    def _refresh_ui_safe(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            adapter = get_private_field(fragment, "adapter")
+            if adapter:
+                adapter.update(True)
+        except Exception:
+            pass
+
+    def _get_string_by_key(self, key):
+        lang = Locale.getDefault().getLanguage()
+        if lang not in self.STRINGS:
+            lang = "en"
+        return self.STRINGS[lang].get(key, key)
+
+    def on_send_message_hook(self, account, params) -> HookResult:
+        if not isinstance(params.message, str):
+            return HookResult()
+        msg = params.message.strip()
+        msg_lower = msg.lower()
+
+        cmd = str(self.get_setting("trigger_command", ".export") or ".export").strip().lower()
+
+        if msg_lower == cmd or msg_lower in (".export", ".sexport"):
+            if self.metadata_loading:
+                run_on_ui_thread(lambda: BulletinHelper.show_info(self._get_string_by_key("loading_meta")))
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            peer_id = getattr(params, "peer", 0)
+            run_on_queue(lambda: self._prepare_dump(peer_id))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()
+
+    def _scan_all_installed_plugins(self):
+        if self.metadata_loading:
+            return
+        self.metadata_loading = True
+        try:
+            plugins_dir = get_plugins_dir()
+            plugins = {}
+
+            pc = PluginsController.getInstance() if PluginsController else None
+
+            # 1. Сначала опрашиваем PluginsController
+            if pc:
+                try:
+                    all_plugins_map = pc.getPlugins() if hasattr(pc, "getPlugins") else getattr(pc, "plugins", None)
+                    if all_plugins_map:
+                        for entry in all_plugins_map.entrySet():
+                            try:
+                                pid = str(entry.getKey())
+                                p_obj = entry.getValue()
+                                if not p_obj:
+                                    continue
+
+                                p_name = str(p_obj.getName()) if (hasattr(p_obj, "getName") and p_obj.getName()) else pid
+                                p_ver = str(p_obj.getVersion()) if (hasattr(p_obj, "getVersion") and p_obj.getVersion()) else "1.0"
+                                p_engine = str(p_obj.getEngine()) if (hasattr(p_obj, "getEngine") and p_obj.getEngine()) else ""
+                                is_on = bool(p_obj.isEnabled()) if hasattr(p_obj, "isEnabled") else self._is_plugin_enabled(pid)
+
+                                p_path = None
+                                try:
+                                    raw_p = pc.getPluginPath(pid)
+                                    if raw_p and os.path.exists(str(raw_p)):
+                                        p_path = str(raw_p)
+                                except Exception:
+                                    pass
+
+                                if not p_path or not os.path.exists(p_path):
+                                    p_path = _find_plugin_path(plugins_dir, pid)
+
+                                is_elyx = (
+                                    "elyx" in p_engine.lower() or
+                                    (p_path and ("elyx" in p_path.lower() or p_path.endswith((".elyx", ".eaf")) or "elyxplugins" in p_path.lower()))
+                                )
+
+                                if p_path and os.path.exists(p_path):
+                                    plugins[pid] = {
+                                        "id": pid,
+                                        "name": p_name,
+                                        "version": p_ver,
+                                        "path": p_path,
+                                        "enabled": is_on,
+                                        "type": "elyx" if is_elyx else "python"
+                                    }
+                            except Exception:
+                                traceback.print_exc()
+                except Exception:
+                    traceback.print_exc()
+
+            # 2. Сканируем файлы в корне plugins_dir (.plugin, .py, .elyx, .eaf)
+            if plugins_dir and os.path.exists(plugins_dir):
+                exts = ('.plugin', '.py', '.elyx', '.eaf')
+                for fname in os.listdir(plugins_dir):
+                    if fname.startswith(".temp"):
+                        continue
+                    fpath = os.path.join(plugins_dir, fname)
+                    if not os.path.isfile(fpath) or not fname.endswith(exts):
+                        continue
+
+                    meta = self._read_plugin_metadata(fpath)
+                    pid = meta.get("__id__", os.path.splitext(fname)[0])
+                    if pid not in plugins:
+                        plugins[pid] = {
+                            "id": pid,
+                            "name": meta.get("__name__", pid),
+                            "version": meta.get("__version__", "1.0"),
+                            "path": fpath,
+                            "enabled": self._is_plugin_enabled(pid),
+                            "type": "elyx" if fname.endswith(('.elyx', '.eaf')) else "python"
+                        }
+
+                # 3. Сканируем распакованные папки ElyxPlugins/
+                elyx_dir = os.path.join(plugins_dir, "ElyxPlugins")
+                if os.path.isdir(elyx_dir):
+                    for d in os.listdir(elyx_dir):
+                        if d == "archives" or d.startswith("."):
+                            continue
+                        dpath = os.path.join(elyx_dir, d)
+                        if os.path.isdir(dpath):
+                            meta = _read_elyx_dir_metadata(dpath)
+                            pid = meta.get("__id__", d)
+                            if pid not in plugins and d not in plugins:
+                                # Предпочитаем архив, если он есть в archives/
+                                p_path = dpath
+                                for ext in ('.elyx', '.eaf'):
+                                    c1 = os.path.join(elyx_dir, "archives", f"{pid}{ext}")
+                                    if os.path.isfile(c1):
+                                        p_path = c1
+                                        break
+                                    c2 = os.path.join(elyx_dir, "archives", f"{d}{ext}")
+                                    if os.path.isfile(c2):
+                                        p_path = c2
+                                        break
+
+                                plugins[pid] = {
+                                    "id": pid,
+                                    "name": meta.get("__name__", pid),
+                                    "version": meta.get("__version__", "1.0"),
+                                    "path": p_path,
+                                    "enabled": self._is_plugin_enabled(pid),
+                                    "type": "elyx"
+                                }
+
+                # 4. Сканируем распакованные подпапки в корне plugins_dir
+                for d in os.listdir(plugins_dir):
+                    if d in ("ElyxPlugins", "datastores", "__pycache__") or d.startswith((".", "temp")):
+                        continue
+                    dpath = os.path.join(plugins_dir, d)
+                    if os.path.isdir(dpath):
+                        has_ref = (
+                            os.path.exists(os.path.join(dpath, "refmap.yml")) or
+                            os.path.exists(os.path.join(dpath, "metainfo.yml")) or
+                            os.path.exists(os.path.join(dpath, "meta.yml")) or
+                            os.path.exists(os.path.join(dpath, "main.py"))
+                        )
+                        if has_ref:
+                            meta = _read_elyx_dir_metadata(dpath)
+                            pid = meta.get("__id__", d)
+                            if pid not in plugins:
+                                plugins[pid] = {
+                                    "id": pid,
+                                    "name": meta.get("__name__", pid),
+                                    "version": meta.get("__version__", "1.0"),
+                                    "path": dpath,
+                                    "enabled": self._is_plugin_enabled(pid),
+                                    "type": "elyx"
+                                }
+
+                # 5. Только в последнюю очередь проверяем ElyxPlugins/archives/
+                if os.path.isdir(elyx_dir):
+                    archives_dir = os.path.join(elyx_dir, "archives")
+                    if os.path.isdir(archives_dir):
+                        for af in os.listdir(archives_dir):
+                            if af.endswith(('.elyx', '.eaf')):
+                                apath = os.path.join(archives_dir, af)
+                                meta = _read_elyx_zip_metadata(apath)
+                                pid = meta.get("__id__", os.path.splitext(af)[0])
+                                if pid not in plugins:
+                                    plugins[pid] = {
+                                        "id": pid,
+                                        "name": meta.get("__name__", pid),
+                                        "version": meta.get("__version__", "1.0"),
+                                        "path": apath,
+                                        "enabled": self._is_plugin_enabled(pid),
+                                        "type": "elyx"
+                                    }
+
+            self.installed_plugins_cache = plugins
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.metadata_loading = False
+
+    def _read_plugin_metadata(self, filepath):
+        metadata = {}
+        try:
+            fname = os.path.basename(filepath)
+            base_id = os.path.splitext(fname)[0]
+
+            if os.path.isdir(filepath):
+                metadata = _read_elyx_dir_metadata(filepath)
+            elif fname.endswith(('.elyx', '.eaf')):
+                metadata = _read_elyx_zip_metadata(filepath)
+            else:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(1024 * 16)
+
+                try:
+                    tree = ast.parse(content)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Assign):
+                            for target in node.targets:
+                                if isinstance(target, ast.Name) and target.id in ['__id__', '__name__', '__version__', '__icon__']:
+                                    if isinstance(node.value, (ast.Constant, ast.Str)):
+                                        metadata[target.id] = (
+                                            node.value.value if isinstance(node.value, ast.Constant) else node.value.s
+                                        )
+                except Exception:
+                    pass
+
+                if not metadata:
+                    patterns = {
+                        '__id__': r'^__id__\s*=\s*[\'"]([^\'"]+)[\'"]',
+                        '__name__': r'^__name__\s*=\s*[\'"]([^\'"]+)[\'"]',
+                        '__version__': r'^__version__\s*=\s*[\'"]([^\'"]+)[\'"]',
+                        '__icon__': r'^__icon__\s*=\s*[\'"]([^\'"]+)[\'"]'
+                    }
+                    for key, pattern in patterns.items():
+                        m = re.search(pattern, content, re.MULTILINE)
+                        if m:
+                            metadata[key] = m.group(1)
+
+            pid = metadata.get('__id__', base_id)
+            metadata['__id__'] = pid
+            metadata['enabled'] = self._is_plugin_enabled(pid)
+            return metadata
+        except Exception:
+            return metadata
+
+    def _manual_dump(self, v):
+        try:
+            frag = get_last_fragment()
+            pid = 0
+            if frag:
+                try:
+                    if hasattr(frag, "getDialogId"):
+                        pid = frag.getDialogId()
+                except Exception:
+                    pass
+            if not pid:
+                try:
+                    pid = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+                except Exception:
+                    pid = 0
+
+            run_on_queue(lambda: self._prepare_dump(pid))
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {e}"))
+
+    def _prepare_dump(self, peer_id):
+        try:
+            self._scan_all_installed_plugins()
+            if not self.installed_plugins_cache:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("error_empty")))
+                return
+
+            run_on_ui_thread(lambda: self._show_export_import_sheet(peer_id, self.installed_plugins_cache, True))
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Prepare error: {e}"))
+
+    def open_import_ui(self, filepath):
+        try:
+            with open(filepath, "rb") as f:
+                content = f.read()
+            data = json.loads(self.decode_and_decompress(content))
+
+            plugins_map = {}
+            if "file_content" in data:
+                meta = data.get("plugin_meta", {})
+                pid = meta.get("id", "unknown")
+                plugins_map[pid] = data
+            else:
+                plugins_map = data
+
+            run_on_ui_thread(lambda: self._show_export_import_sheet(None, plugins_map, False, plugins_map))
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error opening import: {e}"))
+
+    def _show_export_import_sheet(self, peer_id, plugins_data, is_export_mode, parsed_import_data=None):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity():
+                run_on_ui_thread(lambda: BulletinHelper.show_error("No active screen"))
+                return
+
+            self.dex.load()
+            if not self.dex.loaded:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("restart_needed")))
+                return
+
+            items = []
+            if is_export_mode:
+                for pid, pinfo in plugins_data.items():
+                    p_name = pinfo.get("name", pid)
+                    p_ver = str(pinfo.get("version", "1.0"))
+                    status_txt = f"v{p_ver}" if not p_ver.startswith("v") else p_ver
+                    items.append({
+                        "id": pid,
+                        "name": str(p_name),
+                        "subtext": status_txt
+                    })
+            else:
+                for pid, pdata in plugins_data.items():
+                    if not pdata or not isinstance(pdata, dict):
+                        continue
+                    meta = pdata.get("plugin_meta") or {}
+                    p_name = meta.get("name", pid) if isinstance(meta, dict) else pid
+                    p_ver = str(meta.get("version", "1.0")) if isinstance(meta, dict) else "1.0"
+                    status_txt = f"v{p_ver}" if not p_ver.startswith("v") else p_ver
+                    items.append({
+                        "id": str(pid),
+                        "name": str(p_name),
+                        "subtext": status_txt
+                    })
+
+            lang = Locale.getDefault().getLanguage()
+            string_dict = self.STRINGS.get(lang, self.STRINGS["en"])
+
+            items_json_str = json.dumps(items, ensure_ascii=False)
+            strings_json_str = json.dumps(string_dict, ensure_ascii=False)
+
+            plugin_ref = self
+
+            def on_result(result_str):
+                try:
+                    res = json.loads(str(result_str))
+                    sel_list = res.get("selected", [])
+                    if not sel_list:
+                        return
+                    inc_settings = bool(res.get("includeSettings", True))
+                    inc_data = bool(res.get("includeData", True))
+                    inc_pinned = bool(res.get("includePinned", False))
+
+                    if is_export_mode:
+                        target_peer = peer_id
+                        if not target_peer:
+                            try:
+                                target_peer = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+                            except Exception:
+                                target_peer = 0
+                        run_on_queue(lambda: plugin_ref._process_export(target_peer, sel_list, inc_settings, inc_data, inc_pinned))
+                    else:
+                        run_on_queue(lambda: plugin_ref._process_import(parsed_import_data, sel_list, inc_settings, inc_data, inc_pinned))
+                except Exception as ex:
+                    traceback.print_exc()
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Callback error: {ex}"))
+
+            self.dex.call(
+                "pyShowSheet",
+                frag,
+                bool(is_export_mode),
+                items_json_str,
+                strings_json_str,
+                Callback(on_result)
+            )
+
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"UI error: {e}"))
+
+    def _get_settings_native(self, pid):
+        if not engine_settings:
+            return {}
+        try:
+            return engine_settings.get_all_settings(pid) or {}
+        except Exception:
+            return {}
+
+    def _set_setting_native(self, pid, key, value):
+        if not engine_settings:
+            return
+        try:
+            engine_settings.set_setting(pid, key, value)
+        except Exception:
+            pass
+
+    def _clear_settings_native(self, pid):
+        if not engine_settings:
+            return
+        try:
+            if hasattr(engine_settings, "clear_settings"):
+                engine_settings.clear_settings(pid)
+        except Exception:
+            pass
+
+    def _dump_plugin_data(self, pid):
+        data = {
+            "datastores": {},
+            "files": {},
+            "prefs": {}
+        }
+        try:
+            ctx = ApplicationLoader.applicationContext
+            files_dir = str(ApplicationLoader.getFilesDirFixed().getAbsolutePath())
+
+            # 1. Datastores
+            ds_dir = os.path.join(files_dir, "datastores")
+            if os.path.exists(ds_dir):
+                for f in os.listdir(ds_dir):
+                    if f.startswith(f"{pid}_") or f == f"{pid}.json":
+                        p = os.path.join(ds_dir, f)
+                        try:
+                            with open(p, "r", encoding="utf-8", errors="ignore") as jf:
+                                data["datastores"][f] = json.load(jf)
+                        except Exception:
+                            pass
+
+            # 2. Files in filesDir (music_stats, databases, json files)
+            cands = []
+            if os.path.exists(files_dir):
+                for f in os.listdir(files_dir):
+                    if f.startswith(f"{pid}_") or f == f"{pid}.json" or f == f"{pid}.db":
+                        cands.append(f)
+                    elif pid in ("music_stats", "max_music_stats") and (
+                        f == "music_stats_data.json" or
+                        f.startswith("music_stats_data_acc_") or
+                        f == "ym_synced_ids.json"
+                    ):
+                        cands.append(f)
+
+            for cand in cands:
+                p = os.path.join(files_dir, cand)
+                try:
+                    if os.path.isfile(p):
+                        with open(p, "rb") as bf:
+                            raw = bf.read()
+                        data["files"][cand] = base64.b64encode(zlib.compress(raw, 9)).decode('utf-8')
+                except Exception:
+                    pass
+
+            # 3. SharedPreferences
+            pref_names = [pid, f"{pid}_prefs", f"plugin_{pid}"]
+            if pid in ("music_stats", "max_music_stats"):
+                pref_names.append("music_stats_prefs")
+
+            for pname in pref_names:
+                try:
+                    sp = ctx.getSharedPreferences(pname, 0)
+                    all_entries = sp.getAll()
+                    if all_entries and all_entries.size() > 0:
+                        pref_map = {}
+                        for entry in all_entries.entrySet():
+                            k = str(entry.getKey())
+                            v = entry.getValue()
+                            if v is not None:
+                                pref_map[k] = v
+                        data["prefs"][pname] = pref_map
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        return data if (data["datastores"] or data["files"] or data["prefs"]) else None
+
+    def _restore_plugin_data(self, pid, data):
+        if not data or not isinstance(data, dict):
+            return
+        try:
+            ctx = ApplicationLoader.applicationContext
+            files_dir = str(ApplicationLoader.getFilesDirFixed().getAbsolutePath())
+
+            # 1. Restore Datastores
+            datastores = data.get("datastores", {})
+            if datastores:
+                ds_dir = os.path.join(files_dir, "datastores")
+                os.makedirs(ds_dir, exist_ok=True)
+                for fname, content in datastores.items():
+                    try:
+                        p = os.path.join(ds_dir, fname)
+                        with open(p, "w", encoding="utf-8") as jf:
+                            json.dump(content, jf, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+            # 2. Restore Files
+            files = data.get("files", {})
+            if files:
+                for fname, enc in files.items():
+                    try:
+                        raw = zlib.decompress(base64.b64decode(enc))
+                        p = os.path.join(files_dir, fname)
+                        with open(p, "wb") as bf:
+                            bf.write(raw)
+                    except Exception:
+                        pass
+
+            # 3. Restore SharedPreferences
+            prefs = data.get("prefs", {})
+            if prefs:
+                for pname, entries in prefs.items():
+                    try:
+                        sp = ctx.getSharedPreferences(pname, 0)
+                        editor = sp.edit()
+                        for k, v in entries.items():
+                            if isinstance(v, bool):
+                                editor.putBoolean(k, v)
+                            elif isinstance(v, int):
+                                editor.putLong(k, int(v))
+                            elif isinstance(v, float):
+                                editor.putFloat(k, float(v))
+                            elif isinstance(v, str):
+                                editor.putString(k, v)
+                        editor.apply()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _dump_single_plugin_by_info(self, pinfo, include_settings, include_data, include_pinned=False):
+        try:
+            pid = pinfo["id"]
+            path = pinfo["path"]
+            p_type = pinfo.get("type", "python")
+
+            if os.path.isdir(path):
+                # Распакованная папка elyx плагина — пакуем в zip архив в память
+                raw_content = _zip_folder_to_bytes(path)
+                fname = f"{pid}.elyx"
+            else:
+                with open(path, "rb") as f:
+                    raw_content = f.read()
+                fname = os.path.basename(path)
+
+            file_content_enc = base64.b64encode(zlib.compress(raw_content, level=9)).decode('utf-8')
+            enabled_state = pinfo.get("enabled") if "enabled" in pinfo else self._is_plugin_enabled(pid)
+
+            is_pinned = False
+            if include_pinned:
+                try:
+                    if PluginsController and hasattr(PluginsController, "isPluginPinned"):
+                        is_pinned = bool(PluginsController.isPluginPinned(str(pid)))
+                except Exception:
+                    pass
+
+            settings = None
+            if include_settings:
+                settings = self._get_settings_native(pid)
+
+            plugin_data = None
+            if include_data:
+                plugin_data = self._dump_plugin_data(pid)
+
+            return {
+                "file_name": fname,
+                "file_content": file_content_enc,
+                "settings": settings,
+                "plugin_data": plugin_data,
+                "pinned": is_pinned,
+                "plugin_meta": {
+                    "id": pid,
+                    "name": pinfo.get("name", pid),
+                    "version": pinfo.get("version", "1.0"),
+                    "icon": "",
+                    "enabled": enabled_state,
+                    "pinned": is_pinned,
+                    "type": p_type
+                }
+            }
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _process_export(self, peer_id, selected_ids, include_settings, include_data, include_pinned=False):
+        plugins_dir = get_plugins_dir()
+        msg = self._get_string_by_key("export_progress").format(len(selected_ids))
+        run_on_ui_thread(lambda: BulletinHelper.show_info(msg))
+
+        master_data = {}
+        for pid in selected_ids:
+            pinfo = self.installed_plugins_cache.get(pid)
+            if not pinfo:
+                continue
+            dump = self._dump_single_plugin_by_info(pinfo, include_settings, include_data, include_pinned)
+            if dump:
+                master_data[pid] = dump
+
+        if not master_data:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("error_empty")))
+            return
+
+        try:
+            json_str = json.dumps(master_data)
+            final_blob = base64.b64encode(zlib.compress(json_str.encode('utf-8'), level=9)).decode('utf-8')
+            export_name = "plugins-export.pl_export"
+            export_path = os.path.join(plugins_dir, export_name)
+            with open(export_path, "wb") as f:
+                f.write(final_blob.encode('utf-8'))
+
+            if not peer_id:
+                try:
+                    peer_id = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+                except Exception:
+                    peer_id = 0
+
+            send_document(peer_id, export_path, caption=self._get_string_by_key("export_done"))
+            time.sleep(1)
+            try:
+                os.remove(export_path)
+            except Exception:
+                pass
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("export_error").format(e)))
+
+    def _process_import(self, all_data, selected_ids, with_settings, with_data, with_pinned=False):
+        count = 0
+        plugins_dir = get_plugins_dir()
+
+        restore_state = self.get_setting("restore_state_mode", True)
+        force_enable = self.get_setting("force_enable_mode", False)
+
+        try:
+            pc = PluginsController.getInstance() if PluginsController else None
+
+            for pid in selected_ids:
+                if pid not in all_data:
+                    continue
+                pdata = all_data[pid]
+                if not pdata or not isinstance(pdata, dict):
+                    continue
+
+                try:
+                    enc_content = pdata.get("file_content")
+                    if not enc_content:
+                        continue
+
+                    code = self.decode_and_decompress(enc_content)
+                    raw_filename = pdata.get("file_name")
+
+                    meta = pdata.get("plugin_meta") or {}
+                    is_elyx = (meta.get("type") == "elyx" if isinstance(meta, dict) else False) or (raw_filename and raw_filename.endswith(('.elyx', '.eaf')))
+
+                    if raw_filename:
+                        target_filename = raw_filename
+                    elif is_elyx:
+                        target_filename = f"{pid}.elyx"
+                    else:
+                        target_filename = f"{pid}.plugin" if b"__DEX_BEGIN__" in code else f"{pid}.py"
+
+                    target_path = os.path.join(plugins_dir, target_filename)
+                    with open(target_path, "wb") as f:
+                        f.write(code)
+
+                    # Для elyx плагина также распаковываем в ElyxPlugins/{pid} и сохраняем архив в archives/
+                    if is_elyx:
+                        try:
+                            elyx_dest = os.path.join(plugins_dir, "ElyxPlugins", pid)
+                            os.makedirs(elyx_dest, exist_ok=True)
+                            with zipfile.ZipFile(io.BytesIO(code), "r") as zf:
+                                zf.extractall(elyx_dest)
+
+                            # Страховка для Chaquopy/Elyx: гарантируем наличие __init__.py во всех поддиректориях пакета с Python файлами
+                            for root, dirs, files in os.walk(elyx_dest):
+                                has_py = any(f.endswith((".py", ".pyc")) for f in files)
+                                if has_py and "__init__.py" not in files and "__init__.pyc" not in files:
+                                    try:
+                                        with open(os.path.join(root, "__init__.py"), "w", encoding="utf-8") as f_init:
+                                            f_init.write("# init\n")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            traceback.print_exc()
+
+                        try:
+                            arch_dir = os.path.join(plugins_dir, "ElyxPlugins", "archives")
+                            os.makedirs(arch_dir, exist_ok=True)
+                            arch_dest = os.path.join(arch_dir, target_filename)
+                            with open(arch_dest, "wb") as af:
+                                af.write(code)
+                        except Exception:
+                            pass
+
+                    target_state = meta.get("enabled", True) if (isinstance(meta, dict) and restore_state) else force_enable
+
+                    # 1. Restore settings
+                    if with_settings and engine_settings:
+                        self._clear_settings_native(pid)
+                        settings = pdata.get("settings", {})
+                        if isinstance(settings, dict):
+                            for k, v in settings.items():
+                                self._set_setting_native(pid, k, v)
+
+                    # 2. Restore plugin data
+                    if with_data:
+                        if "data" in pdata and pdata["data"]:
+                            self._restore_plugin_data(pid, {"datastores": {f"{pid}_db.json": pdata["data"]}})
+                        if "plugin_data" in pdata and pdata["plugin_data"]:
+                            self._restore_plugin_data(pid, pdata["plugin_data"])
+
+                    # 3. Native load engine invocation
+                    if pc:
+                        file_obj = FileClass(target_path)
+                        engine = None
+                        try:
+                            engine = PluginsController.getPluginEngine(file_obj)
+                        except Exception:
+                            pass
+                        if not engine and hasattr(pc, 'engines'):
+                            engine = pc.engines.get("elyx" if is_elyx else "python")
+
+                        existing = None
+                        try:
+                            if hasattr(pc, 'getPlugins'):
+                                existing = pc.getPlugins().get(pid)
+                            elif hasattr(pc, 'plugins'):
+                                existing = pc.plugins.get(pid)
+                        except Exception:
+                            pass
+
+                        if target_state:
+                            self._invoke_native_load(engine, target_path, existing)
+                            self._set_plugin_enabled(pid, True)
+                        else:
+                            self._set_plugin_enabled(pid, False)
+                            if existing and hasattr(pc, 'unloadPlugin'):
+                                try:
+                                    pc.unloadPlugin(pid)
+                                except Exception:
+                                    pass
+
+                    # 4. Restore pinned state
+                    if with_pinned:
+                        try:
+                            is_pinned = meta.get("pinned", False) if isinstance(meta, dict) else False
+                            if not is_pinned and "pinned" in pdata:
+                                is_pinned = bool(pdata["pinned"])
+                            if PluginsController and hasattr(PluginsController, "setPluginPinned"):
+                                PluginsController.setPluginPinned(str(pid), bool(is_pinned))
+                        except Exception:
+                            pass
+
+                    count += 1
+                except Exception:
+                    traceback.print_exc()
+
+            if count > 0:
+                run_on_ui_thread(lambda: NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.pluginsUpdated))
+                msg = self._get_string_by_key("import_done").format(count)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("not_imported")))
+
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("import_error").format(e)))
+
+    def _invoke_native_load(self, engine, path, existing_plugin):
+        if not engine:
+            return
+        try:
+            for m in engine.getClass().getDeclaredMethods():
+                if m.getName() == "loadPluginFromFile":
+                    m.setAccessible(True)
+                    pts = m.getParameterTypes()
+                    if len(pts) == 4:
+                        m.invoke(engine, path, existing_plugin, None, None)
+                        return
+                    elif len(pts) == 3:
+                        m.invoke(engine, path, existing_plugin, None)
+                        return
+        except Exception:
+            traceback.print_exc()
+
+    def _set_plugin_enabled(self, pid, state):
+        pid_str = str(pid)
+        state_bool = bool(state)
+
+        # 1. Записываем в SharedPreferences plugin_settings (гарантированное сохранение состояния)
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx:
+                prefs = ctx.getSharedPreferences("plugin_settings", 0)
+                editor = prefs.edit()
+                editor.putBoolean(f"plugin_enabled_{pid_str}", state_bool)
+                editor.apply()
+        except Exception:
+            pass
+
+        # 2. Уведомляем PluginsController
+        if PluginsController:
+            try:
+                pc = PluginsController.getInstance()
+                if pc:
+                    try:
+                        pc.setPluginEnabled(pid_str, state_bool, None)
+                    except Exception:
+                        for m in pc.getClass().getDeclaredMethods():
+                            if m.getName() == "setPluginEnabled":
+                                m.setAccessible(True)
+                                m.invoke(pc, pid_str, state_bool, None)
+                                break
+                    plugins_map = pc.getPlugins() if hasattr(pc, "getPlugins") else getattr(pc, "plugins", None)
+                    if plugins_map and plugins_map.containsKey(pid_str):
+                        p_obj = plugins_map.get(pid_str)
+                        if p_obj and hasattr(p_obj, "setEnabled"):
+                            p_obj.setEnabled(state_bool)
+            except Exception:
+                traceback.print_exc()
+
+    def _is_plugin_enabled(self, pid):
+        try:
+            if PluginsController:
+                pc = PluginsController.getInstance()
+                if pc:
+                    active_method = getattr(pc, "isPluginActive$TMessagesProj", None) or getattr(pc, "isPluginActive", None)
+                    if active_method:
+                        try:
+                            return bool(active_method(str(pid)))
+                        except Exception:
+                            pass
+                    plugins_map = pc.getPlugins() if hasattr(pc, "getPlugins") else getattr(pc, "plugins", None)
+                    if plugins_map and plugins_map.containsKey(str(pid)):
+                        p_obj = plugins_map.get(str(pid))
+                        if p_obj and hasattr(p_obj, "isEnabled"):
+                            return bool(p_obj.isEnabled())
+        except Exception:
+            pass
+
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx:
+                prefs = ctx.getSharedPreferences("plugin_settings", 0)
+                key = f"plugin_enabled_{pid}"
+                if prefs.contains(key):
+                    return bool(prefs.getBoolean(key, True))
+        except Exception:
+            pass
+        return True
+
+    def compress_and_encode(self, data):
+        if not data:
+            return ""
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        return base64.b64encode(zlib.compress(data, level=9)).decode('utf-8')
+
+    def decode_and_decompress(self, data):
+        if not data:
+            return b""
+        return zlib.decompress(base64.b64decode(data))
+
+
+__plugin__ = MaxCactusExport
+
+
+# __DEX_BEGIN__
+# PLACEHOLDER
+# __DEX_END__
