@@ -47,7 +47,7 @@ Usage: send the command .export in the chat, or go to: three dots -> Plugins -> 
 Использование: отправьте команду .export в чате / в чате: три точки -> Плагины -> Экспорт плагинов"""
 
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 __icon__ = "MaxExteraPluginsStickers/34"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
